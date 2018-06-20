@@ -1,0 +1,230 @@
+---
+title: "Property Prices Prediction at Block Groups Level"
+author: "Carlos Espino"
+date: "6/10/2018"
+output: 
+  pdf_document: 
+    number_sections: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Data Preparation
+
+## Web scraper
+
+The data was extracted from the Mecklenburg County Property Information System (https://property.spatialest.com/nc/mecklenburg/).
+
+To extract the data, a scraper was built in `python` to get the "Single Family Residential" properties. The scraper involved the following challenges:
+
+* The search webpage renders the results via JavaScript. Therefore we can't use the usual `requests` package, we need a webdriver that emulates the behavior of a web browser. This can be solved using the `selenium` package with a headless webdriver using either Firefox or Chrome. In this case Firefox was used with the geckodriver.
+* An important limitation of the property search engine is that it returns maximum 400 properties for search. Given this restriction, the following strategy was followed:
+    1. The search was limited to properties in the city of **Charlotte**.
+    2. To minimize searches with more than 400 results, the requests per search were divided by adding a filter by price, generating a range of prices from the minimum price, to the maximum price moving by intervals of size $500 (these ranges and the interval size are parameters exposed in the script). **Note:** this strategy doesn't guarantee that the scraper will do an exhaustive search, in some searches we may be still getting more than 400 results, failing to capture the properties that don't fall into the shown results. With proper logging we can know which searches returned more than 400 results, and we can reduce the search interval on those cases to ensure that we capture everything.
+* The scraper grabs the results of each result page (maximum 10 results per page), extracts the id of each of the properties to build their corresponding url. 
+* Once we have the url, we can scrape all the available information of the property. The simplest way to do this, was by looking for `ul`'s with class `data-list` and extracting the `title` (feature name) and `value` (value of the feature).
+* If there's an error while fetching some property information, the id is property logged so we can easily trace back the error and try inserting it later.
+* Only the information shown in the data lists was extracted. Other information like the map, image, sales history or tax bills, was ignored.
+* The search url scraping was divided among different threads using the `multiprocessing` package from Python.
+
+## DB and Schema
+
+For the purpose of this challenge, the DB chosen was MySQL because I'm more familiar with it and I was able to set up the database relatively fast. Another good option is PostgreSQL because it supports some advanced functions that are not implemented in MySQL.
+
+Because the scraper was running locally, a local database was set up to avoid slow uploading of entries to a remote server. However it's pretty easy to setup a MySQL using the RDS service and making sure that the proper inbound rules in the security group are chosen to have remote access to it.
+
+
+The schema chosen was very simple. Having one table named `properties` where the information extracted is stored with the PRIMARY KEY corresponding to the property id from the search page.
+
+Other tables may be added if we want to add, for example, more information about the owners, the neighborhood or even other information at different spatial aggregation levels if we geocode the addresses. 
+
+The query that contains the schema of the table, based on the information extracted, is the following
+
+```
+CREATE TABLE IF NOT EXISTS `landis`.`properties` (
+  `remote_id` INT,
+  `account` VARCHAR(45) NULL,
+  `account_no` INT NULL,
+  `amount` FLOAT NULL,
+  `assessment` FLOAT NULL,
+  `bedrooms` INT NULL,
+  `building_value` FLOAT NULL,
+  `built_use_style` VARCHAR(45) NULL,
+  `current_owners` VARCHAR(45) NULL,
+  `deed_type` VARCHAR(45) NULL,
+  `description` VARCHAR(500) NULL,
+  `external_wall` VARCHAR(45) NULL,
+  `features` FLOAT NULL,
+  `fireplaces` INT NULL,
+  `foundation` VARCHAR(45) NULL,
+  `fuel` VARCHAR(45) NULL,
+  `full_baths` INT NULL,
+  `half_baths` INT NULL,
+  `heat` VARCHAR(45) NULL,
+  `heated_area` FLOAT NULL,
+  `issue_date` DATE NULL,
+  `land` VARCHAR(45) NULL,
+  `land_use_code` VARCHAR(45) NULL,
+  `land_use_desc` VARCHAR(45) NULL,
+  `land_value` FLOAT NULL,
+  `last_sale_date` DATE NULL,
+  `last_sale_price` FLOAT NULL,
+  `legal_description` VARCHAR(45) NULL,
+  `legal_reference` VARCHAR(45) NULL,
+  `location_address` VARCHAR(60) NULL,
+  `luc_at_sale` VARCHAR(45) NULL,
+  `mailing_address` VARCHAR(45) NULL,
+  `neighborhood` VARCHAR(45) NULL,
+  `parcel_id` VARCHAR(45) NULL,
+  `permit_number` VARCHAR(45) NULL,
+  `sale_date` DATE NULL,
+  `sale_price` FLOAT NULL,
+  `story` VARCHAR(45) NULL,
+  `total_sqft` FLOAT NULL,
+  `units` INT NULL,
+  `use` VARCHAR(45) NULL,
+  `year_built` INT NULL,
+  PRIMARY KEY (`remote_id`)
+ )
+```
+
+# Data Analysis
+
+
+## Objective
+The goal of this data analysis will be to predict property prices by block group level using house features and connectedness of the region computed from the street network.
+
+The street network centrality measures are good indicators of the social, economic and spatial prosperity and accessibility of a given region. Therefore, these feature can contribute to the model as indicative of the spatial distribution of resources and access in the city. 
+
+## Data processing 
+We query for all the dataset, which initially has a dimension of **144,031** houses with **110** features measured, and compute the target feature `total_appraised_value` as follows: 
+
+$$
+total\_appraised\_value = building\_value + features + land\_value
+$$
+
+This is computed after the definition of `total_appraised_value` in the search page. The scraper failed to  capture this value, but we can computed with the values we collected.
+
+It would also be useful to compute the value by squared feet, but a bug in the scraper failed to capture properties whose squared feet is greater than 1,000.
+
+The data is then geocoded using the `parcel_id` and joining it with the parcels obtained from the NC One Map (http://data.nconemap.gov/geoportal/catalog/search/resource/details.page?uuid=%7B837C5704-49C8-45A3-B084-AEBF4CD09804%7D). This catalogue contains all the parcels of the county along with the spatial information. In this way we can infer the longitude and latitude of each of the properties.
+
+Other ways to geocode the data is by using the address and use an API like Google or census.gov geocoder. The limitation of the Google API is that it only allows 2,500 requests per day.
+
+
+Once the data is geocoded, we aggregate it by the Census Blocks. The polygons are obtained on the `tiger` package from R.
+
+To aggregate the data, we use only the mean values for the target feature and the predictors which are continuous.
+
+The predictors to use from the original set are `full_baths`, `half_baths`, `year_built` are `bedrooms`. From the parcel dataset we'll use `GISACRES` which is the area of the parcel in Acres and finally we'll extract centrality measurements from the street network `closnss`, `degree` and `btwnnss` which correspond to closeness centrality, degree, and betweenness centrality respectively. The network measurements are explained in the following section.
+
+The census blocks containing at least one NA, are removed.
+
+The final dimensions are **450** observations on **9** features, where one of them is the target and the rest are the predictions.
+
+### Street network features
+
+Street layers were extracted for the city of Charlotte. These street layers were converted into graph networks, representing the intersections as nodes and street segments as edges. Two centrality measures, closeness and betweenness, were calculated to understand each urban area's global and local centrality, which is an indicator of that space's social, economic and spatial prosperity and accessibility. 
+
+The two measures of centrality were calculated using the following formulas:
+
+$$closeness(i) = \frac{1}{\displaystyle \sum_{j \in V} d_{ij}}$$
+  
+Where $d_{ij}$ is the shortest distance between node $i$ and $j$, $V$ is the set of nodes. If the weights are integers, this measure takes values between 0  and 1, $0 \leq closeness(i) \leq 1$, and if the node $i$ is isolated, this value is 0.
+
+The closeness centrality in the city of Charlotte looks like the following:
+
+\begin{figure}[!h]
+\centering
+\includegraphics[width=9cm]{./figures/close_white.png}
+\label{fig:app}
+\end{figure}
+
+High centrality values correspond to red color, while low centrality, to blue color.
+
+Betweenness centrality of node $i \in V$ computes all the shortest paths, and counts the number of them that passes through $i$. This can be presented as: 
+
+$$ betweenness(i) = \sum_{j \neq k \in V}\frac{g_{jk}(i)}{g_{jk}}$$
+
+where $g_{jk}$ is the number of shortest paths between $j$ and $k$, and $g_{jk}(i)$ is the number of those paths that go through $i$.
+
+The  betweenness centrality in the city of Charlotte looks like the following:
+
+\begin{figure}[!h]
+\centering
+\includegraphics[width=9cm]{./figures/between_white.png}
+\label{fig:app}
+\end{figure}
+
+High centrality values correspond to red color, while low centrality, to blue color.
+
+The script to generate the street network and the centrality measures corresponds to `src/R/compute_street_centrality.R`.
+
+## Exploratory data analysis
+
+The shiny app is very useful to explore the correlation between the features. It can be visited in the following link (https://carlosespino11.shinyapps.io/charlotte-app/). 
+
+The following screenshot of the app shows a strong correlation between the number of rooms and the property value.
+
+\begin{figure}[!h]
+\centering
+\includegraphics[width=12cm]{./figures/app.png}
+\label{fig:app}
+\end{figure}
+
+## Results
+
+Only two algorithms were used for the prediction task, elastic-net regularized 
+linear regression and random forest. The baseline to compare the performance of the models, is the mean of the target feature.
+
+The hyper parameters are tuned automatically using 5-$fold$ cross validation on the set of hyper parameters chosen by default by the `caret` package. The performance metric will be `RMSE`. The predictors are center and scaled. The dataset is split in 80% training, 20% testing. The results shown are on the **test** set.
+
+The following figures help to visualize how good the predictions are vs the true labels. Both models are doing a good job, but random forests makes a much better adjustment.
+
+\begin{figure}[!h]
+\centering
+\includegraphics[width=8cm]{./figures/glm_perf.png}
+\label{fig:app}
+\end{figure}
+
+
+\begin{figure}[!h]
+\centering
+\includegraphics[width=8cm]{./figures/rf_perf.png}
+\label{fig:app}
+\end{figure}
+
+
+This can be corroborated  in the following table. Both models are better than the baseline, and the random forest (rf) has a much better RMSE than the regularized regression model (glmnet)
+
+-----------------
+ model     RMSE  
+-------- --------
+  base    207672 
+
+ glmnet   101057 
+
+   rf     47123  
+-----------------
+
+From the random forest we can extract the variable importance using the node impurity at the end of the leaves of the trees.
+
+\begin{figure}[!h]
+\centering
+\includegraphics[width=8cm]{./figures/importance.png}
+\label{fig:app}
+\end{figure}
+
+Unfortunately the street centrality measurements are not good estimators of the property values. Only closeness centrality has a relative high importance. This may happen because closeness centrality is measuring how close is a region to the geographic center of the city.
+
+# Conclusion and future steps
+
+* The scraping  part was challenging because the searches are rendered with JavaScript and the search results are limited to 400. We need more granularity on the searches to have a more exhaustive scrape, but this also needs more requests and it takes longer to finish.
+* Multiprocessing is a good solution to make many searches in parallel and speed up the scraping process.
+* For the data analysis and modeling, the ~ 144k houses were aggregated to 450, census blocks.
+* The network centrality measurements, were not that important as we initially expected.
+* Still, the other house features are strong predictors and we got decent models with low effort.
+* We can add some census features, crime statistics or other information to get more accurate predictions.
+* If we wish to to the predictions at the house level, we can rasterize and interpolate the features and use the value of the feature corresponding to the coordinates of the house.
